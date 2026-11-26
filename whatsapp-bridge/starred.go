@@ -102,7 +102,7 @@ func sendStar(ctx context.Context, client *whatsmeow.Client, store *MessageStore
 	}
 	sender := chat
 	if user := starParticipant(chat, storedSender, isFromMe); user != "" {
-		if sender, err = resolveRecipientJID(client, user); err != nil {
+		if sender, err = groupStarSender(ctx, client, chat, user); err != nil {
 			return fmt.Errorf("invalid stored sender: %w", err)
 		}
 	}
@@ -115,4 +115,41 @@ func sendStar(ctx context.Context, client *whatsmeow.Client, store *MessageStore
 		fmt.Printf("Warning: failed to store star state for %s: %v\n", req.MessageID, err)
 	}
 	return nil
+}
+
+// groupStarSender returns the JID a group star must name for the message's
+// sender. The bridge stores only the sender's bare user, which is the LID
+// digits when the phone number was never learned, so it can't be rebuilt as
+// a phone JID blindly: that names a user who doesn't exist and the star
+// matches nothing on the phone. The group's participant list gives the JID
+// in the group's own addressing (LID or phone). A sender who has left falls
+// back to the LID store.
+func groupStarSender(ctx context.Context, client *whatsmeow.Client, group types.JID, user string) (types.JID, error) {
+	info, err := client.GetGroupInfo(ctx, group)
+	if err == nil {
+		if jid, ok := participantJID(info.Participants, user); ok {
+			return jid, nil
+		}
+	}
+	lid := types.NewJID(user, types.HiddenUserServer)
+	if pn, err := client.Store.LIDs.GetPNForLID(ctx, lid); err == nil && !pn.IsEmpty() {
+		return lid, nil // the stored user is a known LID
+	}
+	if info != nil && info.AddressingMode == types.AddressingModeLID {
+		// Unknown either way, in a LID group: a stored bare user here is
+		// a LID that never resolved to a phone number.
+		return lid, nil
+	}
+	return resolveRecipientJID(client, user)
+}
+
+// participantJID finds the participant whose LID or phone number has the
+// given user, and returns the JID the group addresses them by.
+func participantJID(participants []types.GroupParticipant, user string) (types.JID, bool) {
+	for _, p := range participants {
+		if p.JID.User == user || p.LID.User == user || p.PhoneNumber.User == user {
+			return p.JID.ToNonAD(), true
+		}
+	}
+	return types.JID{}, false
 }

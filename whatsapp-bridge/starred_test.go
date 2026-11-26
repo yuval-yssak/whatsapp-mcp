@@ -125,3 +125,28 @@ func TestStarParticipant(t *testing.T) {
 		}
 	}
 }
+
+func TestParticipantJID(t *testing.T) {
+	lidUser := types.NewJID("123456789012345", types.HiddenUserServer)
+	pnUser := types.NewJID("972500000001", types.DefaultUserServer)
+	participants := []types.GroupParticipant{
+		{JID: lidUser, LID: lidUser, PhoneNumber: pnUser},
+		{JID: types.NewJID("999", types.HiddenUserServer), LID: types.NewJID("999", types.HiddenUserServer)}, // phone hidden
+	}
+	cases := []struct {
+		user string
+		want types.JID
+		ok   bool
+	}{
+		{"123456789012345", lidUser, true},                         // stored as LID digits
+		{"972500000001", lidUser, true},                            // stored as phone digits
+		{"999", types.NewJID("999", types.HiddenUserServer), true}, // hidden phone: stays a LID
+		{"555", types.JID{}, false},                                // left the group
+	}
+	for _, c := range cases {
+		got, ok := participantJID(participants, c.user)
+		if ok != c.ok || got != c.want {
+			t.Errorf("participantJID(%q) = %v, %v; want %v, %v", c.user, got, ok, c.want, c.ok)
+		}
+	}
+}

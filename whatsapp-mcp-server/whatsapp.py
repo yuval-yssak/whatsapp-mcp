@@ -263,8 +263,16 @@ def _annotate_starred(cursor: sqlite3.Cursor, messages: list[Message]) -> None:
     if not messages or not _has_starred_table(cursor):
         return
     keys = {(m.chat_jid, m.id) for m in messages}
-    rows = cursor.execute("SELECT chat_jid, message_id FROM starred_messages WHERE starred = 1").fetchall()
-    starred = keys.intersection((row[0], row[1]) for row in rows)
+    ids = sorted({message_id for _, message_id in keys})
+    starred: set[tuple[str, str]] = set()
+    for start in range(0, len(ids), 500):  # stay under SQLite's variable limit
+        chunk = ids[start : start + 500]
+        rows = cursor.execute(
+            "SELECT chat_jid, message_id FROM starred_messages"
+            f" WHERE starred = 1 AND message_id IN ({', '.join('?' * len(chunk))})",
+            chunk,
+        ).fetchall()
+        starred.update(key for key in ((row[0], row[1]) for row in rows) if key in keys)
     for message in messages:
         message.starred = (message.chat_jid, message.id) in starred
 
@@ -1187,6 +1195,7 @@ def get_last_interaction(jid: str) -> dict[str, Any] | None:
             id=msg_data[6],
             media_type=msg_data[7],
         )
+        _annotate_starred(cursor, [message])
 
         return msg_to_dict(message)
 

@@ -2739,7 +2739,9 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			return
 		}
 		var req StarRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChatJID == "" || strings.TrimSpace(req.MessageID) == "" || req.Starred == nil {
+		err := json.NewDecoder(r.Body).Decode(&req)
+		req.ChatJID, req.MessageID = strings.TrimSpace(req.ChatJID), strings.TrimSpace(req.MessageID)
+		if err != nil || req.ChatJID == "" || req.MessageID == "" || req.Starred == nil {
 			http.Error(w, "chat_jid, message_id and starred are required", http.StatusBadRequest)
 			return
 		}

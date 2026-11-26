@@ -92,6 +92,15 @@ def test_get_message_context_reports_starred(starred_db):
     assert [(m.id, m.starred) for m in context.after] == [("a2", True)]
 
 
+def test_get_last_interaction_reports_starred(starred_db):
+    assert whatsapp.get_last_interaction(ALICE)["starred"] is False  # a3 was unstarred
+    conn = sqlite3.connect(whatsapp.MESSAGES_DB_PATH)
+    conn.execute("UPDATE starred_messages SET starred = 1 WHERE chat_jid = ? AND message_id = 'a3'", (ALICE,))
+    conn.commit()
+    conn.close()
+    assert whatsapp.get_last_interaction(ALICE)["starred"] is True
+
+
 def test_store_without_starred_table(legacy_db):
     assert _starred_by_id() == {"a1": False, "a2": False, "a3": False, "b1": False}
     assert whatsapp.list_messages(starred_only=True, include_context=False) == []
