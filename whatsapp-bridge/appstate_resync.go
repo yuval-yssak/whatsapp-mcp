@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -33,19 +34,29 @@ func (c whatsmeowAppState) AppStateVersion(ctx context.Context, name appstate.WA
 	return version, err
 }
 
-// How long to wait for the phone's recovery snapshot, and how often to look.
+// Timing of a repair. The whole repair stays under the bridge's 60s HTTP
+// WriteTimeout, so the caller still gets the answer.
 var (
-	appStateRecoveryTimeout = 45 * time.Second
+	appStateRepairBudget    = 50 * time.Second
+	appStateRecoveryTimeout = 30 * time.Second // wait for the phone's snapshot
 	appStateRecoveryPoll    = time.Second
 )
 
-// appStateDiverged reports whether a send failed because the bridge can't
-// reconcile the collection with the server: a 409 conflict whose returned
-// patches don't verify, typically "failed to verify patch vN: mismatching
-// LTHash". whatsmeow's own retry only applies those patches on top of the
-// stored state, so every later send fails the same way.
+// appStateRepairMu runs one repair at a time: concurrent sends on a broken
+// collection would otherwise each wipe and refetch it, and a send encoded
+// while another resync has the version row deleted fails spuriously.
+var appStateRepairMu sync.Mutex
+
+// appStateDiverged reports whether the server rejected a send and the
+// patches it returned don't verify against the stored state ("failed to
+// verify patch vN: mismatching LTHash"). whatsmeow's own retry applies those
+// patches on top of the stored state, so every later send fails the same way.
+//
+// Both parts are required. Other server errors (4xx, rate limits) are not
+// fixed by a resync, and an LTHash error without ErrAppStateUpdate comes from
+// the fetch whatsmeow runs after the server already accepted the patch.
 func appStateDiverged(err error) bool {
-	return errors.Is(err, whatsmeow.ErrAppStateUpdate) || errors.Is(err, appstate.ErrMismatchingLTHash)
+	return errors.Is(err, whatsmeow.ErrAppStateUpdate) && errors.Is(err, appstate.ErrMismatchingLTHash)
 }
 
 // sendAppStateWithResync sends an app-state patch and, if the collection has
@@ -55,10 +66,18 @@ func appStateDiverged(err error) bool {
 // own patch chain doesn't verify either (seen with regular_high v148, where a
 // clean snapshot + patches still fails the LTHash check), it asks the phone
 // for its copy of the collection (whatsmeow's fatal-recovery request) and
-// waits for that to land in the store.
+// waits for that to land in the store. Both repairs keep the device linked.
 func sendAppStateWithResync(ctx context.Context, client appStateClient, patch appstate.PatchInfo, logf func(string, ...any)) error {
 	err := client.SendAppState(ctx, patch)
 	if err == nil || !appStateDiverged(err) {
+		return err
+	}
+	appStateRepairMu.Lock()
+	defer appStateRepairMu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, appStateRepairBudget)
+	defer cancel()
+	// Another request may have repaired the collection while this one waited.
+	if err = client.SendAppState(ctx, patch); err == nil || !appStateDiverged(err) {
 		return err
 	}
 	logf("App state %s diverged from the server (%v); doing a full resync", patch.Type, err)
