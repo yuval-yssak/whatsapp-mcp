@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
@@ -15,6 +16,20 @@ type fakeAppStateClient struct {
 	sends     int
 	fullSyncs []appstate.WAPatchName
 	syncErr   error
+
+	version      uint64
+	recoveries   int
+	phoneVersion uint64 // version the phone's snapshot brings; 0 = phone never answers
+}
+
+func (f *fakeAppStateClient) RequestRecovery(_ context.Context, _ appstate.WAPatchName) error {
+	f.recoveries++
+	f.version = f.phoneVersion
+	return nil
+}
+
+func (f *fakeAppStateClient) AppStateVersion(_ context.Context, _ appstate.WAPatchName) (uint64, error) {
+	return f.version, nil
 }
 
 func (f *fakeAppStateClient) SendAppState(_ context.Context, _ appstate.PatchInfo) error {
@@ -80,8 +95,29 @@ func TestSendAppStateWithResync(t *testing.T) {
 		if err := sendAppStateWithResync(context.Background(), f, patch, noLog); err == nil {
 			t.Fatal("want error")
 		}
-		if f.sends != 1 {
-			t.Fatalf("sends=%d", f.sends)
+		if f.sends != 1 || f.recoveries != 0 {
+			t.Fatalf("sends=%d recoveries=%d", f.sends, f.recoveries)
+		}
+	})
+
+	shortRecovery(t)
+	lthashErr := fmt.Errorf("failed to verify patch v148: %w", appstate.ErrMismatchingLTHash)
+
+	t.Run("server chain broken: recover from the phone, then retry", func(t *testing.T) {
+		f := &fakeAppStateClient{sendErrs: []error{divergedErr}, syncErr: lthashErr, phoneVersion: 148}
+		if err := sendAppStateWithResync(context.Background(), f, patch, noLog); err != nil {
+			t.Fatal(err)
+		}
+		if f.recoveries != 1 || f.sends != 2 {
+			t.Fatalf("sends=%d recoveries=%d", f.sends, f.recoveries)
+		}
+	})
+
+	t.Run("phone never answers: give up without retrying", func(t *testing.T) {
+		f := &fakeAppStateClient{sendErrs: []error{divergedErr}, syncErr: lthashErr}
+		err := sendAppStateWithResync(context.Background(), f, patch, noLog)
+		if err == nil || f.recoveries != 1 || f.sends != 1 {
+			t.Fatalf("err=%v sends=%d recoveries=%d", err, f.sends, f.recoveries)
 		}
 	})
 
@@ -94,4 +130,11 @@ func TestSendAppStateWithResync(t *testing.T) {
 			t.Fatalf("sends=%d fullSyncs=%v", f.sends, f.fullSyncs)
 		}
 	})
+}
+
+func shortRecovery(t *testing.T) {
+	t.Helper()
+	timeout, poll := appStateRecoveryTimeout, appStateRecoveryPoll
+	appStateRecoveryTimeout, appStateRecoveryPoll = 50*time.Millisecond, 5*time.Millisecond
+	t.Cleanup(func() { appStateRecoveryTimeout, appStateRecoveryPoll = timeout, poll })
 }
