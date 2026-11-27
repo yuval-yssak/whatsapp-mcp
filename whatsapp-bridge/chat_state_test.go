@@ -3,9 +3,11 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/types"
@@ -205,5 +207,168 @@ func TestBackfillReadMarkerFromUnreadCount(t *testing.T) {
 	}
 	if r := readChatState(t, ms, other); r.lastReadTime.Valid {
 		t.Fatalf("marker set to %s with too few messages", r.lastReadTime.Time)
+	}
+}
+
+// A full sync replays every chat's latest mark-as-read, however old. It must
+// not set a read marker, or the pairing-time UnreadCount anchor is skipped and
+// every inbound message since that old mark-as-read counts as unread.
+func TestFullSyncMarkAsReadKeepsReadMarker(t *testing.T) {
+	ms := newChatStateStore(t)
+	jid := types.NewJID("123", types.DefaultUserServer)
+	old := time.Unix(1_670_000_000, 0).UTC()
+	action := &waSyncAction.MarkChatAsReadAction{
+		Read:         proto.Bool(true),
+		MessageRange: &waSyncAction.SyncActionMessageRange{LastMessageTimestamp: proto.Int64(old.Unix())},
+	}
+
+	handleChatStateEvent(nil, ms, &events.MarkChatAsRead{JID: jid, Timestamp: old, Action: action, FromFullSync: true}, waLog.Noop)
+	r := readChatState(t, ms, jid.String())
+	if r.lastReadTime.Valid {
+		t.Fatalf("full-sync replay set last_read_time = %s", r.lastReadTime.Time)
+	}
+	if !r.markedUnread.Valid || r.markedUnread.Int64 != 0 {
+		t.Fatalf("marked_unread = %+v, want 0 (the replay still carries the flag)", r.markedUnread)
+	}
+
+	// The history-sync anchor can now place the marker.
+	if err := ms.BackfillReadMarkerAt(jid.String(), old.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// A live mark-as-read still moves it forward.
+	live := old.Add(48 * time.Hour)
+	action.MessageRange.LastMessageTimestamp = proto.Int64(live.Unix())
+	handleChatStateEvent(nil, ms, &events.MarkChatAsRead{JID: jid, Timestamp: live, Action: action}, waLog.Noop)
+	if r := readChatState(t, ms, jid.String()); !r.lastReadTime.Time.Equal(live) {
+		t.Fatalf("last_read_time = %s after live mark-as-read, want %s", r.lastReadTime.Time, live)
+	}
+}
+
+func historyMsg(fromMe bool, ts int64, m *waProto.Message) *waProto.HistorySyncMsg {
+	return &waProto.HistorySyncMsg{Message: &waProto.WebMessageInfo{
+		Key:              &waProto.MessageKey{FromMe: proto.Bool(fromMe)},
+		MessageTimestamp: proto.Uint64(uint64(ts)),
+		Message:          m,
+	}}
+}
+
+func TestHistoryReadAnchor(t *testing.T) {
+	text := &waProto.Message{Conversation: proto.String("hi")}
+	poll := &waProto.Message{PollCreationMessage: &waProto.PollCreationMessage{Name: proto.String("lunch?")}}
+	reaction := &waProto.Message{ReactionMessage: &waProto.ReactionMessage{Text: proto.String("👍")}}
+	edit := &waProto.Message{ProtocolMessage: &waProto.ProtocolMessage{}}
+	// Newest first, as history sync sends them.
+	messages := []*waProto.HistorySyncMsg{
+		historyMsg(false, 160, reaction),
+		historyMsg(false, 150, edit),
+		historyMsg(false, 140, poll), // unread, not stored by the bridge
+		historyMsg(true, 130, text),
+		historyMsg(false, 120, text), // unread
+		historyMsg(false, 110, text), // newest read inbound: the anchor
+		historyMsg(false, 100, text),
+		nil,
+	}
+	got, ok := historyReadAnchor(messages, 2)
+	if !ok || got.Unix() != 110 {
+		t.Fatalf("anchor = %d, %v; want 110 (the poll counts, the reaction and edit don't)", got.Unix(), ok)
+	}
+	if _, ok := historyReadAnchor(messages, 4); ok {
+		t.Fatal("anchored with only 4 inbound messages for 4 unread")
+	}
+}
+
+func TestBackfillReadMarkerAtOnlyFillsEmptyMarker(t *testing.T) {
+	ms := newChatStateStore(t)
+	jid := "123@s.whatsapp.net"
+	t1 := time.Unix(1_700_000_000, 0).UTC()
+	if _, err := ms.db.Exec("INSERT INTO chats (jid, name) VALUES (?, 'x')", jid); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.BackfillReadMarkerAt(jid, t1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.BackfillReadMarkerAt(jid, t1.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if r := readChatState(t, ms, jid); !r.lastReadTime.Time.Equal(t1) {
+		t.Fatalf("last_read_time = %s, want %s", r.lastReadTime.Time, t1)
+	}
+}
+
+// A mark-read through the bridge sends no app-state mutation, so the
+// phone's flag must win again at the next full-sync replay.
+func TestLocalMarkedUnreadClearYieldsToPhone(t *testing.T) {
+	ms := newChatStateStore(t)
+	jid := "123@s.whatsapp.net"
+	at := time.Unix(1_700_000_000, 0)
+	if err := ms.SetChatMarkedUnread(jid, true, at); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.ClearChatMarkedUnreadLocally(jid); err != nil {
+		t.Fatal(err)
+	}
+	if r := readChatState(t, ms, jid); r.markedUnread.Int64 != 0 {
+		t.Fatalf("marked_unread = %d after local clear, want 0", r.markedUnread.Int64)
+	}
+	if err := ms.SetChatMarkedUnread(jid, true, at); err != nil {
+		t.Fatal(err)
+	}
+	if r := readChatState(t, ms, jid); r.markedUnread.Int64 != 1 {
+		t.Fatalf("marked_unread = %d after the phone's mutation replayed, want 1", r.markedUnread.Int64)
+	}
+}
+
+func TestAppStateChatJIDFlagsUnmappedLID(t *testing.T) {
+	t.Cleanup(func() { chatStateUnresolvedLID.Store(false) })
+	chatStateUnresolvedLID.Store(false)
+	phone := types.NewJID("123", types.DefaultUserServer)
+	if got := appStateChatJID(nil, phone); got != phone.String() || chatStateUnresolvedLID.Load() {
+		t.Fatalf("phone JID: got %s, flagged=%v", got, chatStateUnresolvedLID.Load())
+	}
+	lid := types.NewJID("999", types.HiddenUserServer)
+	if got := appStateChatJID(nil, lid); got != lid.String() || !chatStateUnresolvedLID.Load() {
+		t.Fatalf("unmapped LID: got %s, flagged=%v", got, chatStateUnresolvedLID.Load())
+	}
+}
+
+func TestLIDChatMigrationCarriesChatFlags(t *testing.T) {
+	ms := newChatStateStore(t)
+	waPath := filepath.Join(t.TempDir(), "whatsapp.db")
+	waDB, err := sql.Open("sqlite3", waPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = waDB.Close() }()
+	if _, err := waDB.Exec(`CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT NOT NULL);
+		INSERT INTO whatsmeow_lid_map VALUES ('111', '222');`); err != nil {
+		t.Fatal(err)
+	}
+	lid, phone := "111@lid", "222@s.whatsapp.net"
+	t1 := time.Unix(1_700_000_000, 0)
+	// Archived on the @lid row (newer), muted on the phone row (newer there).
+	if err := ms.SetChatArchived(lid, true, t1.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.SetChatArchived(phone, false, t1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.SetChatMutedUntil(lid, 0, t1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.SetChatMutedUntil(phone, -1, t1.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.MigrateLegacyLIDChatsToPhoneJIDs(waPath, waLog.Noop); err != nil {
+		t.Fatal(err)
+	}
+	r := readChatState(t, ms, phone)
+	if r.archived.Int64 != 1 {
+		t.Fatalf("archived = %+v, want 1 from the newer @lid mutation", r.archived)
+	}
+	if r.mutedUntil.Int64 != -1 {
+		t.Fatalf("muted_until = %+v, want -1 kept from the newer phone mutation", r.mutedUntil)
+	}
+	if r.markedUnread.Valid {
+		t.Fatalf("marked_unread = %+v, want NULL: neither row set it", r.markedUnread)
 	}
 }

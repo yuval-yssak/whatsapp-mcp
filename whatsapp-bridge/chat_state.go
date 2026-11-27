@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"sync/atomic"
 	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -121,6 +123,58 @@ func muteEndMillis(muted bool, endTimestamp int64) int64 {
 // stored. A chat that already has a marker is left alone, and with fewer than
 // unreadCount+1 inbound messages stored there is nothing to anchor on.
 // Counted like the MCP server: reactions and deleted messages are skipped.
+// BackfillReadMarkerAt sets the read marker of a chat that has none.
+func (store *MessageStore) BackfillReadMarkerAt(chatJID string, readAt time.Time) error {
+	_, err := store.db.Exec(
+		`UPDATE chats SET last_read_time = ? WHERE jid = ? AND last_read_time IS NULL`,
+		readAt, chatJID,
+	)
+	return err
+}
+
+// ClearChatMarkedUnreadLocally clears marked_unread without touching its
+// mutation time. Reading a chat through the bridge sends receipts but no
+// app-state mutation, so the phone may keep its flag. Keeping the phone's
+// time lets the next full-sync replay of that mutation restore the flag,
+// and any newer phone mutation wins as usual.
+func (store *MessageStore) ClearChatMarkedUnreadLocally(chatJID string) error {
+	_, err := store.db.Exec(`UPDATE chats SET marked_unread = 0 WHERE jid = ?`, chatJID)
+	return err
+}
+
+// historyReadAnchor finds where the read marker goes for a history-sync
+// conversation the phone reports unreadCount unread messages for: the time
+// of the newest inbound message that isn't unread. It counts the
+// conversation's own messages, including the polls, locations and other
+// kinds the bridge doesn't store, which the phone's count also includes.
+// Counting only stored rows would put the marker too early and count
+// already-read messages as unread. Reactions and protocol messages (edits,
+// revokes) aren't in the phone's count and are skipped here too. It reports
+// false when the chunk holds too few messages to anchor on.
+//
+// The marker has one-second resolution, as stored timestamps do, so an
+// unread message sent in the same second as the anchor counts as read.
+func historyReadAnchor(messages []*waProto.HistorySyncMsg, unreadCount uint32) (time.Time, bool) {
+	var inbound []time.Time
+	for _, msg := range messages {
+		info := msg.GetMessage()
+		if info == nil || info.GetKey().GetFromMe() || info.GetMessageTimestamp() == 0 {
+			continue
+		}
+		m := info.GetMessage()
+		if m == nil || m.GetReactionMessage() != nil || m.GetProtocolMessage() != nil ||
+			m.GetEncReactionMessage() != nil {
+			continue
+		}
+		inbound = append(inbound, time.Unix(int64(info.GetMessageTimestamp()), 0))
+	}
+	if uint32(len(inbound)) <= unreadCount {
+		return time.Time{}, false
+	}
+	sort.Slice(inbound, func(i, j int) bool { return inbound[i].After(inbound[j]) })
+	return inbound[unreadCount], true
+}
+
 func (store *MessageStore) BackfillReadMarkerFromUnreadCount(chatJID string, unreadCount uint32) error {
 	_, err := store.db.Exec(
 		`UPDATE chats SET last_read_time = (
@@ -146,9 +200,25 @@ func (store *MessageStore) BackfillReadMarkerFromUnreadCount(chatJID string, unr
 
 // appStateChatJID maps an app-state target to the chat JID messages are
 // stored under. App-state patches carry no alt JIDs, so LID chats resolve
-// through the whatsmeow LID store only.
+// through the whatsmeow LID store only. It doesn't log: the startup sync
+// calls it for every chat.
+//
+// A LID with no mapping yet is stored under the @lid JID and flags
+// chatStateUnresolvedLID. At pairing that is the normal case, because the
+// app-state sync runs before history sync fills in the LID map.
+// resyncChatStateAfterLIDMapping then repeats the sync, and the startup LID
+// migration carries whatever is left onto the phone-JID row.
 func appStateChatJID(client *whatsmeow.Client, jid types.JID) string {
-	return resolveLIDChat(client, jid, types.EmptyJID, types.EmptyJID, false).String()
+	if jid.Server != types.HiddenUserServer {
+		return jid.String()
+	}
+	if client != nil && client.Store != nil && client.Store.LIDs != nil {
+		if pn, err := client.Store.LIDs.GetPNForLID(context.Background(), jid); err == nil && !pn.IsEmpty() {
+			return pn.ToNonAD().String()
+		}
+	}
+	chatStateUnresolvedLID.Store(true)
+	return jid.String()
 }
 
 // handleChatStateEvent stores archive / mute / mark-as-unread app-state
@@ -172,10 +242,14 @@ func handleChatStateEvent(client *whatsmeow.Client, store *MessageStore, evt int
 		if err := store.SetChatMarkedUnread(jid, !read, v.Timestamp); err != nil {
 			logger.Warnf("Failed to store marked-unread state for %s: %v", jid, err)
 		}
-		if read {
-			// "Mark as read" on the phone reads the whole chat up to its last
-			// message; the monotonic merge keeps a stale full-sync value from
-			// moving the marker back.
+		// "Mark as read" on the phone reads the whole chat up to its last
+		// message. Only a live mutation moves the read marker. A full sync
+		// replays every chat's latest one, months old for most chats, and at
+		// pairing it lands before history sync. A replayed marker would then
+		// block the history-sync UnreadCount anchor
+		// (BackfillReadMarkerFromUnreadCount) and count every inbound
+		// message since that old mark-as-read as unread.
+		if read && !v.FromFullSync {
 			readAt := v.Timestamp
 			if ts := v.Action.GetMessageRange().GetLastMessageTimestamp(); ts > 0 {
 				readAt = time.Unix(ts, 0)
@@ -218,6 +292,29 @@ var chatStateSynced atomic.Bool
 // chatStateSyncing keeps back-to-back Connected events from running two
 // full snapshot downloads at once.
 var chatStateSyncing atomic.Bool
+
+// chatStateUnresolvedLID is set when an app-state target was a LID with no
+// phone mapping yet. chatStateLIDResynced limits the repeat sync it triggers
+// to one per process.
+var (
+	chatStateUnresolvedLID atomic.Bool
+	chatStateLIDResynced   atomic.Bool
+)
+
+// resyncChatStateAfterLIDMapping repeats the chat app-state sync once, after
+// a history sync, if the first one hit LIDs it couldn't map. History sync
+// carries the LID map, so the repeat stores those flags on the phone-JID chat
+// rather than on an @lid row that list_chats never shows.
+func resyncChatStateAfterLIDMapping(ctx context.Context, client *whatsmeow.Client, logger waLog.Logger) {
+	if !chatStateSynced.Load() || !chatStateUnresolvedLID.Load() ||
+		!chatStateLIDResynced.CompareAndSwap(false, true) {
+		return
+	}
+	chatStateUnresolvedLID.Store(false)
+	chatStateSynced.Store(false)
+	logger.Infof("Repeating the chat app-state sync: the first one hit LID chats with no phone mapping yet")
+	syncChatStateOnce(ctx, client, logger)
+}
 
 // syncChatStateOnce re-downloads the chat app-state snapshots so the bridge
 // learns the current archive / mute / marked-unread state of every chat,

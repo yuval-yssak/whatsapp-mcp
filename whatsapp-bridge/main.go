@@ -522,6 +522,10 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 		return fmt.Errorf("failed to merge destination chat metadata: %w", err)
 	}
 
+	if err := migrateLIDChatFlags(tx); err != nil {
+		return err
+	}
+
 	insertResult, err := tx.Exec(`
 		INSERT OR IGNORE INTO messages (
 			id, chat_jid, sender, content, timestamp, is_from_me,
@@ -589,6 +593,41 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 		deletedMessages,
 		deletedChats,
 	)
+	return nil
+}
+
+// migrateLIDChatFlags carries the app-state flags of @lid chat rows onto
+// their phone-JID rows before the migration deletes them. App state that
+// arrived before the LID was mapped is stored on the @lid row. The newest
+// mutation wins, as in setChatFlag. A store without the flag columns
+// (created before they existed) has nothing to carry.
+func migrateLIDChatFlags(tx *sql.Tx) error {
+	for _, flag := range []chatFlag{chatFlagArchived, chatFlagMutedUntil, chatFlagMarkedUnread} {
+		var n int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info('chats') WHERE name IN (?, ?)`, flag.value, flag.ts,
+		).Scan(&n); err != nil {
+			return fmt.Errorf("failed to inspect chats.%s: %w", flag.value, err)
+		}
+		if n != 2 {
+			continue
+		}
+		newest := fmt.Sprintf(`
+			SELECT l.%%s FROM chats l
+			JOIN tmp_lid_to_phone m ON m.lid_jid = l.jid
+			WHERE m.phone_jid = chats.jid AND l.%[1]s > chats.%[1]s
+			ORDER BY l.%[1]s DESC LIMIT 1`, flag.ts)
+		if _, err := tx.Exec(fmt.Sprintf(`
+			UPDATE chats SET
+				%[1]s = (%[3]s),
+				%[2]s = (%[4]s)
+			WHERE jid IN (SELECT phone_jid FROM tmp_lid_to_phone)
+			  AND EXISTS (%[3]s)`,
+			flag.value, flag.ts, fmt.Sprintf(newest, flag.value), fmt.Sprintf(newest, flag.ts),
+		)); err != nil {
+			return fmt.Errorf("failed to carry chats.%s from LID chats: %w", flag.value, err)
+		}
+	}
 	return nil
 }
 
@@ -2713,8 +2752,10 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			fmt.Printf("Warning: failed to persist local read marker for %s: %v\n", req.ChatJID, err)
 		}
 		// Reading the chat here also clears a manual "mark as unread"; no
-		// self-receipt comes back to this device to do it.
-		if err := messageStore.SetChatMarkedUnread(req.ChatJID, false, time.Now()); err != nil {
+		// self-receipt comes back to this device to do it. Cleared locally
+		// only: the phone gets no app-state mutation, so its flag wins again
+		// at the next sync (see ClearChatMarkedUnreadLocally).
+		if err := messageStore.ClearChatMarkedUnreadLocally(req.ChatJID); err != nil {
 			fmt.Printf("Warning: failed to clear marked-unread for %s: %v\n", req.ChatJID, err)
 		}
 
@@ -3767,8 +3808,16 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 			// Messages are stored now, so the reported count can anchor the
 			// marker. Only an explicit non-zero count; zero is handled above.
+			// The conversation's own messages anchor it best; the stored
+			// rows are the fallback when the chunk is too short.
 			if conversation.UnreadCount != nil && conversation.GetUnreadCount() > 0 {
-				if err := messageStore.BackfillReadMarkerFromUnreadCount(chatJID, conversation.GetUnreadCount()); err != nil {
+				var err error
+				if anchor, ok := historyReadAnchor(messages, conversation.GetUnreadCount()); ok {
+					err = messageStore.BackfillReadMarkerAt(chatJID, anchor)
+				} else {
+					err = messageStore.BackfillReadMarkerFromUnreadCount(chatJID, conversation.GetUnreadCount())
+				}
+				if err != nil {
 					logger.Warnf("Failed to backfill read marker from unread count for %s: %v", chatJID, err)
 				}
 			}
@@ -3776,6 +3825,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	// This history sync may have brought the LID map the chat app-state
+	// sync was missing.
+	go resyncChatStateAfterLIDMapping(context.Background(), client, logger)
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
