@@ -296,9 +296,11 @@ def _chat_state_select(cursor: sqlite3.Cursor, chat_alias: str) -> str:
     Reactions and deleted messages are not counted, and status@broadcast
     never counts.
 
-    Timestamps are compared as stored text. That is correct while the bridge
-    runs in one timezone, UTC in practice: go-sqlite3 writes the host's
-    offset, and text order differs from time order across offsets.
+    Timestamps are compared as stored text, with the offset of the bridge
+    host's local time (go-sqlite3 writes it). Text order matches time order
+    only while every timestamp has the same offset. A host in a timezone
+    with daylight saving time breaks that in the hour after the clocks go
+    back: 01:10+02:00 sorts before 01:30+03:00 although it is later.
     """
     chat_columns = _table_columns(cursor, "chats")
     message_columns = _table_columns(cursor, "messages")
